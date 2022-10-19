@@ -3,20 +3,15 @@
 ##################################################
 # Program Name:         TCFreeze
 # Original Author:      Mark A. Hix
-# Date Last Updated:    2022 July 13
+# Date Last Updated:    2022 October 11
 # Version:              1.2
 # Software Required:    Python3,TeraChem
 # Contributors/Testers: Ashlyn Murphy,
 #                       Solomon Yamoah Effah
 ##################################################
-
-
-#################### TO DO ####################
-# - Add percentage-of-n-atoms thresholds
-# - Add range-from-over-threshhold unfreezing algo
-
-###############################################
-
+################# CHANGE LOG #####################
+# 2022-08-16: Added "Finalize()" function to complete optimization without restraints. (v1.2)
+##################################################
 # library imports
 import glob
 import subprocess
@@ -42,21 +37,23 @@ def Print_Frozen_To_Input_Log(frozen_indices: list,step_number: int,JobSettings:
             f.write(PadHeading("Getting Initial Gradient"))
             f.write(PadHeading(f"Started at {DateTime()}"))
             for key,value in kwargs.items():
-                f.write(PadHeading(f"{key:<20} {value:>10}"))
+                f.write(PadHeading(f"{key:<20}: {value:>10}"))
         if step_number <= 1:
+            f.write(PadHeading("Beginning TCFreeze Optimizations"))
             f.write(PadHeading(f"Started at {DateTime()}"))
             for key,value in JobSettings.items():
                 f.write(f"{key:<30}{value:30}\n")
-        if step_number == 1:
-            f.write(PadHeading("Beginning TCFreeze Optimizations"))
+        
         f.write("\n")
         if step_number>0:
             frozen_indices.sort()
-            num_chars=int(len(str(frozen_indices[-1])))
+            num_chars = 0
+            if len(frozen_indices) > 0:
+                num_chars=int(len(str(frozen_indices[-1])))
             num_indices_before_line = 80//(num_chars+1)
             f.write(PadHeading(f"Iteration {step_number}"))
             f.write(PadHeading(f"Started at {DateTime()}"))
-            f.write(PadHeading(f"Frozen Atom Indices: {len(frozen_indices):>7}"))
+            f.write(PadHeading(f"Frozen Atom Indices: {len(frozen_indices)}"))
             for i in range(len(frozen_indices)):
                 f.write(f"{frozen_indices[i]:<{num_chars}} ")
                 if i%num_indices_before_line == num_indices_before_line-1:
@@ -110,7 +107,12 @@ def ProcessOutputFile(outputfile):
 class System():
     def __init__(self,input_file,threshold,steps_per_cycle):
         self.steps_per_cycle = steps_per_cycle
-        self.threshold = threshold
+        if "%" in threshold:
+           self.threshold = threshold
+        elif str(threshold).upper() != "UNRESTRAINED":
+            self.threshold = float(threshold)
+        else:
+            self.threshold = threshold
         self._parse_job_settings(input_file)
         os.chdir(os.path.dirname(os.path.abspath(input_file)))
         self.coords  = self.job_settings["coordinates"]
@@ -120,7 +122,7 @@ class System():
         self.maininpfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"maininpfile.txt")
         self.mainlogfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"mainlogfile.txt")
         self.mainerrfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"mainerrfile.txt")
-        if steps_per_cycle < 2:
+        if steps_per_cycle == 1:
             self.steps_per_cycle = 2
         self.converged = False
         self.frozen_atoms=[]
@@ -210,7 +212,10 @@ class System():
     def _write_input_file(self,com_file):
         with open(com_file,"w+") as of:
             for key,value in self.job_settings.items():
-                of.write(f"{key:<30}{value}\n")
+                if key == "nstep" and self.steps_per_cycle == 0:
+                    self.steps_per_cycle = 10
+#                    continue
+                of.write(f"{key:<30}{value:<50}\n")
             if self.frozen_atoms != []:
                 of.write("$constraints\n")
                 of.write("".join([f"atom {x}\n" for x in self.frozen_atoms]))
@@ -236,6 +241,9 @@ class System():
     def Macroiteration(self):
         ### get frozen atoms
         ### write input file
+        comfile = f"minim_{self.iterations}.in"
+        outfile = f"minim_{self.iterations}_output"
+        errfile = f"minim_{self.iterations}_error"
         if self.iterations == 0:
             self.job_settings["run"] = "gradient"
         if self.iterations > 0:
@@ -243,25 +251,25 @@ class System():
             self.job_settings["run"] = "minimize"
         if self.iterations > 1:
             self.job_settings["coordinates"] = "optim.rst7"
-        self._write_input_file("TCFreeze.in")
+        self._write_input_file(comfile)
         Print_Frozen_To_Input_Log(self.frozen_atoms,self.iterations,self.job_settings,self.maininpfile,Threshold=self.threshold,Subcycles=self.steps_per_cycle)
         ### run input file with terachem
-        self.silent_shell(f"terachem TCFreeze.in 1> TCFreeze.out 2> TCFreeze.err")
+        self.silent_shell(f"terachem {comfile} 1> {outfile} 2> {errfile}")
         #### check for convergence
         if self.iterations > 0:
-            self.Check_If_Complete("TCFreeze.out")
+            self.Check_If_Complete(outfile)
             self.silent_shell(f"mv optim.dcd optim_{self.iterations}.dcd")
         #### Process input, output, and error files to respective main logs.
         with open(self.mainlogfile,"a") as of:
             of.write(PadHeading(f"Macroiteration {self.iterations}"))
-            of.write(ProcessOutputFile("TCFreeze.out"))
-        with open("TCFreeze.err","r") as f:
+            of.write(ProcessOutputFile(outfile))
+        with open(errfile,"r") as f:
             errorfile = f.read().strip()
             if errorfile:
-                self.silent_shell(f"cat TCFreeze.err >> {self.mainerrfile}")
+                self.silent_shell(f"cat {errfile} >> {self.mainerrfile}")
                 self.silent_shell(f"echo '\n\n#####################################\n\n' >> {self.mainerrfile}")
         #### update gradient
-        self._get_gradient("TCFreeze.out")
+        self._get_gradient(outfile)
         self.iterations +=1
 
     def Optimize(self,max_steps=0):
@@ -276,7 +284,14 @@ class System():
                     self.converged=True
         os.chdir("../")
         return
-    
+    def Finalize(self):
+        self.threshold = "unrestrained"
+        self.converged = False
+        os.chdir(self.work_dir)
+        while not self.converged:
+            self.Macroiteration()
+        os.chdir("../")
+        return
     def silent_shell(self,com_line):
         devnull = open(os.devnull,"w")
         subprocess.call(com_line,shell=True,stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
@@ -290,5 +305,6 @@ if __name__ == "__main__":
     parser.add_argument("-n","--nsteps-per-opt",dest="nsteps",help="Number of optimization steps before recalculating which atoms to freeze.",required=True)
     parser.add_argument("-m","--max-opt-steps",dest="maxsteps",help="Maximum total number of optimization/freezing cycles (The maximum number of times the system will recalculate frozen atoms).",default=0)
     args = parser.parse_args()
-    job = System(args.infile,float(args.thresh),int(args.nsteps))
+    job = System(args.infile,args.thresh,int(args.nsteps))
     job.Optimize(int(args.maxsteps))
+    job.Finalize()
