@@ -145,7 +145,8 @@ class System():
             key=strline.split()[0]
             value=strline.split()[1]
             self.job_settings[key]=value
-        self.job_settings["run"] = "minimize"
+        if self.job_settings["run"] != "conical":
+            self.job_settings["run"] = "minimize"
         self.job_settings["new_minimizer"] = "no"
         self.job_settings["min_coordinates"] = "cartesian"
         self.job_settings["nstep"] = self.steps_per_cycle
