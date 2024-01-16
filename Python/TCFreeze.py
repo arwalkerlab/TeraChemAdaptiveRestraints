@@ -113,15 +113,15 @@ class System():
             self.threshold = float(threshold)
         else:
             self.threshold = threshold
+        self.maininpfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"maininpfile.txt")
+        self.mainlogfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"mainlogfile.txt")
+        self.mainerrfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"mainerrfile.txt")
         self._parse_job_settings(input_file)
         os.chdir(os.path.dirname(os.path.abspath(input_file)))
         self.coords  = self.job_settings["coordinates"]
         self.regions = self.job_settings["qmindices"]
         self.prmtop  = self.job_settings["prmtop"]
         self.work_dir= f"{self.coords.split('.')[0]}_{str(self.threshold).replace('%','pct')}thresh_{self.steps_per_cycle}spc"
-        self.maininpfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"maininpfile.txt")
-        self.mainlogfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"mainlogfile.txt")
-        self.mainerrfile=os.path.join(os.path.dirname(os.path.abspath(input_file)),"mainerrfile.txt")
         if steps_per_cycle == 1:
             self.steps_per_cycle = 2
         self.converged = False
@@ -146,7 +146,16 @@ class System():
             value=strline.split()[1]
             self.job_settings[key]=value
         if self.job_settings["run"] != "conical":
+            self._is_conical = False
             self.job_settings["run"] = "minimize"
+        if self.job_settings["run"] == "conical":
+            self._is_conical = True
+        if self._is_conical:
+            with open(self.mainlogfile,"a") as f:
+                f.write("Performing Minimum Energy Conical Intersection.\n")
+        else:
+            with open(self.mainlogfile,"a") as f:
+                f.write("Performing Geometry Optimization.\n")
         self.job_settings["new_minimizer"] = "no"
         self.job_settings["min_coordinates"] = "cartesian"
         self.job_settings["nstep"] = self.steps_per_cycle
@@ -238,40 +247,123 @@ class System():
                     print("TCFREEZE JOB FAILURE.  REVIEW OUTPUTS.")
                     self.converged=True
         return
-  
-    def Macroiteration(self):
-        ### get frozen atoms
-        ### write input file
-        comfile = f"minim_{self.iterations}.in"
-        outfile = f"minim_{self.iterations}_output"
-        errfile = f"minim_{self.iterations}_error"
-        if self.iterations == 0:
-            self.job_settings["run"] = "gradient"
-        if self.iterations > 0:
-            self._freeze_atoms()
-            self.job_settings["run"] = "minimize"
-        if self.iterations > 1:
-            self.job_settings["coordinates"] = "optim.rst7"
+    def RunGradientCalc(self):
+        comfile = f"gradient_{self.iterations}.in"
+        outfile = f"gradient_{self.iterations}_output"
+        errfile = f"gradient_{self.iterations}_error"
+        tmp_run_type = self.job_settings["run"]
+        self.job_settings["run"] = "gradient"
         self._write_input_file(comfile)
         Print_Frozen_To_Input_Log(self.frozen_atoms,self.iterations,self.job_settings,self.maininpfile,Threshold=self.threshold,Subcycles=self.steps_per_cycle)
         ### run input file with terachem
         self.silent_shell(f"terachem {comfile} 1> {outfile} 2> {errfile}")
         #### check for convergence
-        if self.iterations > 0:
-            self.Check_If_Complete(outfile)
-            self.silent_shell(f"mv optim.dcd optim_{self.iterations}.dcd")
+        self.job_settings["run"] = tmp_run_type
+        self._get_gradient(outfile)
         #### Process input, output, and error files to respective main logs.
         with open(self.mainlogfile,"a") as of:
-            of.write(PadHeading(f"Macroiteration {self.iterations}"))
+            of.write(PadHeading(f"Macroiteration {self.iterations} - Gradient"))
             of.write(ProcessOutputFile(outfile))
         with open(errfile,"r") as f:
             errorfile = f.read().strip()
             if errorfile:
                 self.silent_shell(f"cat {errfile} >> {self.mainerrfile}")
                 self.silent_shell(f"echo '\n\n#####################################\n\n' >> {self.mainerrfile}")
-        #### update gradient
+        self.iterations += 1
+        return
+    
+    def RunOptimizationCalc(self):
+        comfile = f"minim_{self.iterations}.in"
+        outfile = f"minim_{self.iterations}_output"
+        errfile = f"minim_{self.iterations}_error"
+        tmp_run_type = self.job_settings["run"]
+        self.job_settings["run"] = "minimize"
+        self._write_input_file(comfile)
+        Print_Frozen_To_Input_Log(self.frozen_atoms,self.iterations,self.job_settings,self.maininpfile,Threshold=self.threshold,Subcycles=self.steps_per_cycle)
+        ### run input file with terachem
+        self.silent_shell(f"terachem {comfile} 1> {outfile} 2> {errfile}")
+        #### check for convergence
+        #### check for convergence
+        self.Check_If_Complete(outfile)
+        self.silent_shell(f"mv optim.dcd optim_{self.iterations}.dcd")
+        self.job_settings["run"] = tmp_run_type
         self._get_gradient(outfile)
-        self.iterations +=1
+        #### Process input, output, and error files to respective main logs.
+        with open(self.mainlogfile,"a") as of:
+            of.write(PadHeading(f"Macroiteration {self.iterations} - Geometry Optimization"))
+            of.write(ProcessOutputFile(outfile))
+        with open(errfile,"r") as f:
+            errorfile = f.read().strip()
+            if errorfile:
+                self.silent_shell(f"cat {errfile} >> {self.mainerrfile}")
+                self.silent_shell(f"echo '\n\n#####################################\n\n' >> {self.mainerrfile}")
+        self.iterations += 1
+        return
+
+    def RunConicalCalc(self):
+        comfile = f"meci_{self.iterations}.in"
+        outfile = f"meci_{self.iterations}_output"
+        errfile = f"meci_{self.iterations}_error"
+        tmp_run_type = self.job_settings["run"]
+        self.job_settings["run"] = "conical"
+        self._write_input_file(comfile)
+        Print_Frozen_To_Input_Log(self.frozen_atoms,self.iterations,self.job_settings,self.maininpfile,Threshold=self.threshold,Subcycles=self.steps_per_cycle)
+        ### run input file with terachem
+        self.silent_shell(f"terachem {comfile} 1> {outfile} 2> {errfile}")
+        #### check for convergence
+        self.Check_If_Complete(outfile)
+        self.silent_shell(f"mv optim.dcd optim_{self.iterations}.dcd")
+        self.job_settings["run"] = tmp_run_type
+        #### Process input, output, and error files to respective main logs.
+        with open(self.mainlogfile,"a") as of:
+            of.write(PadHeading(f"Macroiteration {self.iterations} - MECI"))
+            of.write(ProcessOutputFile(outfile))
+        with open(errfile,"r") as f:
+            errorfile = f.read().strip()
+            if errorfile:
+                self.silent_shell(f"cat {errfile} >> {self.mainerrfile}")
+                self.silent_shell(f"echo '\n\n#####################################\n\n' >> {self.mainerrfile}")
+        self.RunGradientCalc()
+        return
+
+    def Macroiteration(self):
+        ### get frozen atoms
+        ### write input file
+        # comfile = f"minim_{self.iterations}.in"
+        # outfile = f"minim_{self.iterations}_output"
+        # errfile = f"minim_{self.iterations}_error"
+        if self.iterations == 0:
+            self.RunGradientCalc()
+            # self.job_settings["run"] = "gradient"
+        if self.iterations > 1:
+            self.job_settings["coordinates"] = "optim.rst7"
+        if self.iterations > 0:
+            self._freeze_atoms()
+            if self._is_conical:
+                self.RunConicalCalc()
+            else:
+                self.RunOptimizationCalc()
+            # self.job_settings["run"] = "minimize"
+        # self._write_input_file(comfile)
+        # Print_Frozen_To_Input_Log(self.frozen_atoms,self.iterations,self.job_settings,self.maininpfile,Threshold=self.threshold,Subcycles=self.steps_per_cycle)
+        # ### run input file with terachem
+        # self.silent_shell(f"terachem {comfile} 1> {outfile} 2> {errfile}")
+        # #### check for convergence
+        # if self.iterations > 0:
+        #     self.Check_If_Complete(outfile)
+        #     self.silent_shell(f"mv optim.dcd optim_{self.iterations}.dcd")
+        # #### Process input, output, and error files to respective main logs.
+        # with open(self.mainlogfile,"a") as of:
+        #     of.write(PadHeading(f"Macroiteration {self.iterations}"))
+        #     of.write(ProcessOutputFile(outfile))
+        # with open(errfile,"r") as f:
+        #     errorfile = f.read().strip()
+        #     if errorfile:
+        #         self.silent_shell(f"cat {errfile} >> {self.mainerrfile}")
+        #         self.silent_shell(f"echo '\n\n#####################################\n\n' >> {self.mainerrfile}")
+        # #### update gradient
+        # self._get_gradient(outfile)
+        # self.iterations +=1
 
     def Optimize(self,max_steps=0):
         self.silent_shell(f"mkdir -p {self.work_dir}")
