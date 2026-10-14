@@ -610,7 +610,7 @@ void System::_write_input_file(std::string inputfilename)
         outFile << "$constraints" << std::endl;
         for (int i = 0; i < frozen_atoms.size(); i++)
         {
-            outFile << frozen_atoms[i] << std::endl;
+            outFile << "atom " << frozen_atoms[i] << std::endl;
         }
         outFile << "$end" << std::endl;
     }
