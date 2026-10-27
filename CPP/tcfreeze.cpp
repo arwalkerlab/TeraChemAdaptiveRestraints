@@ -16,6 +16,9 @@
 #include <iomanip>
 #include "tcfreeze.h"
 
+/* Build command (simple)
+    g++ -std=c++17 tcfreeze.cpp -o TCFreeze -lstdc++fs
+*/
 bool DEBUG_VERBOSE = false;
 
 namespace fs = std::experimental::filesystem;
@@ -422,10 +425,15 @@ void System::_parse_job_settings()
 {
     std::ifstream inFile;
     std::string line;
+    user_frozen_atoms = {};
     inFile.open(SubmittedInputFile,std::ios::in);
     while (getline(inFile,line))
     {
-
+        if(line.find("$constraint") != std::string::npos)
+        {
+            // in the constraint section.
+            break;
+        }
         if (utils::isComment(line) || utils::isEmpty(line))
            continue;
         std::stringstream dummy;
@@ -437,6 +445,21 @@ void System::_parse_job_settings()
         if (utils::isEmpty(key)||utils::isEmpty(value))
             continue;
         JobSettings[key] = value.c_str();
+    }
+    if (line.find("$constraint") != std::string::npos)
+    {
+        while(getline(inFile,line))
+        {
+            if (line.find("$end") != std::string::npos)
+            {
+                break;
+            }
+            if (line.find("atom") != std::string::npos)
+            {
+                int ufa = stoi(line.substr(line.find("atom ")+5));
+                user_frozen_atoms.push_back(ufa);
+            }
+        }
     }
     JobSettings["run"] = "minimize";
     JobSettings["new_minimizer"] = "no";
@@ -562,6 +585,10 @@ void System::_get_gradient(std::string outputfile)
 void System::_freeze_atoms()
 {
     frozen_atoms={};
+    for (int a : user_frozen_atoms)
+    {
+        frozen_atoms.push_back(a);
+    }
     if (no_threshold)
         current_threshold = 0.0;
     else if (dynamic_threshold)
@@ -736,6 +763,7 @@ void System::Macroiteration()
 
 System::System(std::string input_file,std::string thresh, int spc, int msteps)
 {
+    
     SubmittedDirectory = fs::absolute(fs::current_path());
     WorkingDirectory = SubmittedDirectory.string() + "/TCFreeze_scr/";
     utils::Debug("Identified Submitted and Working directories:");
@@ -752,6 +780,7 @@ System::System(std::string input_file,std::string thresh, int spc, int msteps)
     static_threshold = false;
     dynamic_threshold = false;
     no_threshold = false;
+    user_frozen_atoms = {};
     utils::Debug("Initialized all internal starting boolean flags.");
     if (utils::isSubstring(thresh,"%"))
     {
@@ -854,7 +883,7 @@ void System::Finalize()
     fs::path workpath {fs::absolute(WorkingDirectory)};
     fs::path startdir {fs::absolute(fs::current_path())};
     fs::current_path(workpath);
-    JobSettings["nstep"] = "10000";
+    JobSettings["nstep"] = std::to_string(stoi(JobSettings["nstep"])*3); // triple the cycle length for unrestrained finalization - don't run forever.
     while (!converged)
     {
         Macroiteration();

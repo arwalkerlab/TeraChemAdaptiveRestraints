@@ -79,6 +79,7 @@ class System
         std::string regions; //Obtained in _parse_job_settings()
         std::string prmtop;  //Obtained in _parse_job_settings()
         std::vector<int> frozen_atoms;
+        std::vector<int> user_frozen_atoms;
         std::vector<double> gradient;
         std::vector<int> indices;
         double max_grad;
