@@ -889,6 +889,203 @@ void System::Finalize()
         Macroiteration();
     }
     fs::current_path(startdir);
+    ParseAllOutputs();
+}
+
+void System::ParseAllOutputs()
+{
+    std::ofstream ofile("convergence.py",std::ios::out);
+    if (! ofile.is_open())
+    {
+        return;
+    }
+    ofile << R"""(#!/usr/bin/env python3
+"""Parse TeraChem convergence blocks from numbered output files, count frozen atoms
+from the matching .in files -> CSV + multi-plot PNG with a "Finalize" marker."""
+import argparse
+import csv
+import os
+import re
+import sys
+
+METRICS = ["Energy", "Max step", "RMS step", "Max grad", "RMS grad"]
+LINE_RE = re.compile(
+    r"^\s*(Energy|Max step|RMS step|Max grad|RMS grad)\s+(\S+)\s+Target:\s+(\S+)\s+converged\?\s+(yes|no)\s*$"
+)
+
+
+def natural_key(s):
+    """Sort key splitting digit runs so file2 < file10."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+
+
+BLOCK_START_RE = re.compile(r"^\$constraint(s|_freeze)?$", re.I)
+
+
+def count_frozen(path):
+    """
+    Input: path to a TeraChem input (.in) file.
+    Output: number of frozen atoms, or None if the file does not exist.
+    Behavior: finds every $constraint (also $constraints / $constraint_freeze) block,
+    ending at $end. Comments after '#' and blank lines are ignored. Any remaining line
+    inside a block means atoms are frozen. Atom indices are collected from integer
+    tokens and ranges (e.g. 5-20, comma or space separated); non-numeric tokens such
+    as a leading 'xyz' are skipped. A missing block or an empty block gives 0.
+    If a block has content but no atom indices could be parsed, the number of
+    content lines is returned (nonzero, so the file still counts as frozen) and a
+    warning is printed to stderr.
+    """
+    if not os.path.isfile(path):
+        return None
+    atoms, content_lines, inblock = set(), 0, False
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            first = line.split()[0]
+            if not inblock:
+                if BLOCK_START_RE.match(first):
+                    inblock = True
+                continue
+            if first.lower() == "$end":
+                inblock = False
+                continue
+            content_lines += 1
+            for tok in re.split(r"[,\s]+", line):
+                m = re.fullmatch(r"(\d+)(?:-(\d+))?", tok)
+                if m:
+                    lo = int(m.group(1))
+                    hi = int(m.group(2)) if m.group(2) else lo
+                    atoms.update(range(lo, hi + 1))
+    if content_lines and not atoms:
+        print(f"warning: {path}: constraint block has content but no atom indices "
+              f"were parsed; reporting {content_lines} (line count)", file=sys.stderr)
+        return content_lines
+    return len(atoms)
+
+def parse_file(path):
+    """
+    Input: path to one TeraChem output file.
+    Output: list of dicts, one per complete 5-line convergence block.
+    Behavior: scans lines; collects the five metrics in a pending dict and emits a
+    row once "RMS grad" (the last line of the block) is seen. Incomplete blocks are dropped.
+    """
+    rows, pending = [], {}
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            m = LINE_RE.match(line)
+            if not m:
+                continue
+            name, val, tgt, conv = m.groups()
+            if name == "Energy":
+                pending = {}
+            pending[name] = (float(val), float(tgt), conv)
+            if name == "RMS grad" and len(pending) == len(METRICS):
+                rows.append(pending)
+                pending = {}
+    return rows
+
+
+def find_finalize(records):
+    """
+    Input: records, list of (step, filename, block dict, n_frozen).
+    Output: step number of the first record with 0 frozen atoms that follows at least
+            one record with >0 frozen atoms, or None if no such transition exists.
+    """
+    seen_frozen = False
+    for step, _, _, nfz in records:
+        if nfz is None:
+            continue
+        if nfz > 0:
+            seen_frozen = True
+        elif seen_frozen:
+            return step
+    return None
+
+
+def write_csv(path, records):
+    """Writes records (list of (step, filename, block dict, n_frozen)) to CSV."""
+    header = ["step", "file", "n_frozen"]
+    for n in METRICS:
+        header += [n, f"{n} target", f"{n} converged"]
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(header)
+        for step, fname, blk, nfz in records:
+            row = [step, fname, "" if nfz is None else nfz]
+            for n in METRICS:
+                row += list(blk[n])
+            w.writerow(row)
+
+
+def make_plot(path, records, finalize):
+    """Writes a stacked log-y plot (one subplot per metric) with dashed target lines
+    and, if finalize is not None, a dashed red vertical line at that step."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    steps = [r[0] for r in records]
+    fig, axes = plt.subplots(len(METRICS), 1, sharex=True, figsize=(8, 2.2 * len(METRICS)))
+    for ax, n in zip(axes, METRICS):
+        ax.semilogy(steps, [r[2][n][0] for r in records], "o-", ms=3, label=n)
+        ax.semilogy(steps, [r[2][n][1] for r in records], "--", color="gray", lw=1, label="target")
+        if finalize is not None:
+            ax.axvline(finalize, ls="--", color="red", lw=1, label="Finalize")
+        ax.set_ylabel(n)
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("Step")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Parse TeraChem convergence blocks (Energy, Max/RMS step, Max/RMS grad) "
+                    "from multiple output files into a CSV and a multi-panel log-scale PNG. "
+                    "For each FILE (e.g. minim_0001.out), the matching .in file in the same "
+                    "directory (minim_0001.in) is read to count atoms frozen via "
+                    "$constraint_freeze; a dashed 'Finalize' line marks the first step with "
+                    "no frozen atoms after a step that had some."
+    )
+    ap.add_argument("files", nargs="+", metavar="FILE",
+                    help="TeraChem output files; naturally sorted by name (shell globs OK)")
+    ap.add_argument("-c", "--csv", default="convergence.csv", metavar="PATH",
+                    help="output CSV path (default: convergence.csv)")
+    ap.add_argument("-p", "--png", default="convergence.png", metavar="PATH",
+                    help="output PNG path (default: convergence.png)")
+    args = ap.parse_args()
+
+    records, step = [], 0
+    for f in sorted(args.files, key=natural_key):
+        inp = os.path.splitext(f)[0] + ".in"
+        nfz = count_frozen(inp)
+        if nfz is None:
+            print(f"warning: {inp} not found; n_frozen left blank for {f}", file=sys.stderr)
+        for blk in parse_file(f):
+            step += 1
+            records.append((step, f, blk, nfz))
+    if not records:
+        sys.exit("No complete convergence blocks found.")
+
+    finalize = find_finalize(records)
+    write_csv(args.csv, records)
+    make_plot(args.png, records, finalize)
+    msg = f"{len(records)} steps from {len(args.files)} files -> {args.csv}, {args.png}"
+    msg += f"; Finalize at step {finalize}" if finalize else "; no Finalize transition found"
+    print(msg)
+
+
+if __name__ == "__main__":
+    main()
+)""";
+    ofile.close();
+    std::stringstream buffer;
+    buffer.str("");
+    buffer << "python3 convergence.py " << JobSettings["scrdir"] << "/minim_*out -c convergence_data.csv -p convergence_data.png";
+    system(buffer.str().c_str());
 }
 
 int main(int argc, char **argv)

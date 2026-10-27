@@ -99,6 +99,7 @@ class System
         void _write_input_file(std::string);
         void Check_If_Complete(std::string);
         void Macroiteration();
+        void ParseAllOutputs();
 
     public:
         System(std::string,std::string,int,int);
